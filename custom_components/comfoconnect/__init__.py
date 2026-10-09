@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -21,7 +22,7 @@ from aiocomfoconnect.properties import (
 from aiocomfoconnect.sensors import Sensor
 from aiocomfoconnect.util import version_decode
 from homeassistant.components import network
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
+from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_HOST, EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import (
@@ -147,37 +148,50 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    @callback
     async def send_keepalive(now) -> None:
-        """Send keepalive to the bridge."""
-        _LOGGER.debug("Sending keepalive...")
-        try:
-            # Use cmd_time_request as a keepalive since cmd_keepalive doesn't send back a reply we can wait for
-            await bridge.cmd_time_request()
-            bridge.set_available(True)
+        """Send a keepalive, and start a new session when the bridge lost ours."""
+        # Connecting can take up to the library's connect timeout, which is as long as the
+        # keepalive interval. Don't let a second keepalive run into a reconnect in progress.
+        if bridge.keepalive_lock.locked():
+            _LOGGER.debug("The previous keepalive is still running")
+            return
 
-        except ComfoConnectNotAllowed:
-            # The connection is still open, but the bridge no longer accepts our session (taken
-            # over by another client, or dropped by the bridge). The read loop doesn't notice
-            # this, so the sensors would keep their last values. Start a new session instead.
-            _LOGGER.warning("The bridge refused the session, starting a new one")
+        async with bridge.keepalive_lock:
+            _LOGGER.debug("Sending keepalive...")
+            try:
+                # Use cmd_time_request as a keepalive since cmd_keepalive doesn't send back a reply we can wait for
+                await bridge.cmd_time_request()
+                bridge.set_available(True)
+                return
+
+            except ComfoConnectNotAllowed:
+                # The connection is still open, but the bridge no longer accepts our session (taken
+                # over by another client, or dropped by the bridge). The read loop doesn't notice
+                # this, so the sensors would keep their last values. Start a new session instead.
+                _LOGGER.warning("The bridge refused the session, starting a new one")
+                session_refused = True
+
+            except (AioComfoConnectNotConnected, AioComfoConnectTimeout, AioComfoConnectNotReachable):
+                session_refused = False
+
             bridge.set_available(False)
-            await bridge.disconnect()
+
+            # The entry is being unloaded: don't open a session that nothing would close again.
+            if entry.state is not ConfigEntryState.LOADED:
+                return
+
+            if session_refused:
+                await bridge.disconnect()
+
             try:
                 await bridge.connect(entry.data[CONF_LOCAL_UUID])
+                # connect() returns right away while the library is still reconnecting on its own,
+                # so only report the bridge as available once the session answers.
+                await bridge.cmd_time_request()
                 bridge.set_available(True)
             except ComfoConnectNotAllowed:
                 entry.async_start_reauth(hass)
             except (AioComfoConnectNotConnected, AioComfoConnectTimeout, AioComfoConnectNotReachable):
-                _LOGGER.debug("Could not connect to the bridge. Retrying later...")
-
-        except (AioComfoConnectNotConnected, AioComfoConnectTimeout, AioComfoConnectNotReachable):
-            bridge.set_available(False)
-            # Reconnect when connection has been dropped
-            try:
-                await bridge.connect(entry.data[CONF_LOCAL_UUID])
-                bridge.set_available(True)
-            except (AioComfoConnectTimeout, AioComfoConnectNotReachable):
                 _LOGGER.debug("Could not connect to the bridge. Retrying later...")
 
     entry.async_on_unload(async_track_time_interval(hass, send_keepalive, KEEP_ALIVE_INTERVAL))
@@ -185,7 +199,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Disconnect when shutting down
     async def disconnect_bridge(event):
         """Close connection to the bridge."""
-        await bridge.disconnect()
+        async with bridge.keepalive_lock:
+            await bridge.disconnect()
 
     entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, disconnect_bridge))
 
@@ -196,7 +211,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         bridge = hass.data[DOMAIN][entry.entry_id]
-        await bridge.disconnect()
+        # Wait for a running keepalive, so it can't start a new session after this one is closed.
+        async with bridge.keepalive_lock:
+            await bridge.disconnect()
         hass.data[DOMAIN].pop(entry.entry_id)
 
     return unload_ok
@@ -216,6 +233,7 @@ class ComfoConnectBridge(ComfoConnect):
         )
         self.hass = hass
         self.is_available = True
+        self.keepalive_lock = asyncio.Lock()
 
     @callback
     def set_available(self, available: bool) -> None:

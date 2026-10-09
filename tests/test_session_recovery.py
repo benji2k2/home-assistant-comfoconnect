@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -13,7 +14,7 @@ import pytest
 # dependencies don't include yet, so skip them where it isn't installed.
 pytest.importorskip("pytest_homeassistant_custom_component")
 
-from aiocomfoconnect.exceptions import ComfoConnectNotAllowed, ComfoConnectRmiError
+from aiocomfoconnect.exceptions import AioComfoConnectNotConnected, ComfoConnectNotAllowed, ComfoConnectRmiError
 from custom_components.comfoconnect import KEEP_ALIVE_INTERVAL, ComfoConnectBridge
 from custom_components.comfoconnect.const import CONF_LOCAL_UUID, CONF_UUID, DOMAIN
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
@@ -62,6 +63,11 @@ def bridge_fixture():
             new_callable=AsyncMock,
             return_value=True,
         ),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_unload_platforms",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
     ):
         yield SimpleNamespace(connect=connect, disconnect=disconnect, get_property=get_property, time_request=time_request)
 
@@ -103,7 +109,8 @@ async def test_refused_session_starts_a_new_one(hass: HomeAssistant, entry, brid
     assert await hass.config_entries.async_setup(entry.entry_id)
     ccb = hass.data[DOMAIN][entry.entry_id]
     bridge.connect.reset_mock()
-    bridge.time_request.side_effect = ComfoConnectNotAllowed("NOT_ALLOWED")
+    # Refused once, then the new session answers.
+    bridge.time_request.side_effect = [ComfoConnectNotAllowed("NOT_ALLOWED"), None]
 
     await keepalive(hass)
 
@@ -136,3 +143,80 @@ async def test_working_keepalive_does_not_reconnect(hass: HomeAssistant, entry, 
     bridge.time_request.assert_awaited()
     bridge.connect.assert_not_awaited()
     bridge.disconnect.assert_not_awaited()
+
+
+async def settle() -> None:
+    """Let the event loop run the scheduled keepalive as far as it gets."""
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+
+def fire_keepalive(hass: HomeAssistant, times: int = 1) -> None:
+    """Move the clock on by `times` keepalive intervals."""
+    async_fire_time_changed(hass, dt_util.utcnow() + times * (KEEP_ALIVE_INTERVAL + timedelta(seconds=1)))
+
+
+async def test_available_only_once_the_new_session_answers(hass: HomeAssistant, entry, bridge) -> None:
+    """connect() returns at once while the library is still reconnecting: stay unavailable."""
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    ccb = hass.data[DOMAIN][entry.entry_id]
+    bridge.time_request.side_effect = AioComfoConnectNotConnected("not connected")
+
+    with patch.object(ConfigEntry, "async_start_reauth") as start_reauth:
+        await keepalive(hass)
+
+    bridge.connect.assert_awaited()
+    assert not ccb.is_available
+    start_reauth.assert_not_called()
+
+
+async def test_overlapping_keepalive_is_skipped(hass: HomeAssistant, entry, bridge) -> None:
+    """A keepalive that fires while the previous one is still reconnecting does nothing."""
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    bridge.connect.reset_mock()
+    release = asyncio.Event()
+
+    async def slow_connect(*args):
+        await release.wait()
+
+    bridge.connect.side_effect = slow_connect
+    bridge.time_request.side_effect = [AioComfoConnectNotConnected("not connected"), None, None]
+
+    fire_keepalive(hass)
+    await settle()
+    assert bridge.connect.await_count == 1, "the first keepalive is reconnecting"
+
+    fire_keepalive(hass, 2)
+    await settle()
+    assert bridge.connect.await_count == 1, "the second one must not start another connect"
+    assert bridge.time_request.await_count == 1, "nor send a keepalive in between"
+
+    release.set()
+    await hass.async_block_till_done()
+    assert hass.data[DOMAIN][entry.entry_id].is_available
+
+
+async def test_unload_waits_for_a_running_keepalive(hass: HomeAssistant, entry, bridge) -> None:
+    """A keepalive that is still running when the entry unloads must not open a new session."""
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    bridge.connect.reset_mock()
+    release = asyncio.Event()
+
+    async def hanging_time_request():
+        await release.wait()
+        raise AioComfoConnectNotConnected("not connected")
+
+    bridge.time_request.side_effect = hanging_time_request
+
+    fire_keepalive(hass)
+    await settle()
+    unload = hass.async_create_task(hass.config_entries.async_unload(entry.entry_id))
+    await settle()
+    bridge.disconnect.assert_not_awaited()  # waits for the keepalive
+
+    release.set()
+    assert await unload
+
+    bridge.connect.assert_not_awaited()
+    bridge.disconnect.assert_awaited_once()
+    assert entry.state is ConfigEntryState.NOT_LOADED
