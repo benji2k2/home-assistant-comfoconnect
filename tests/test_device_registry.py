@@ -1,0 +1,72 @@
+"""The ventilation unit is registered as a device connected through the bridge."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+# These tests set up the integration in a real Home Assistant instance. They need
+# pytest-homeassistant-custom-component (and asyncio_mode = "auto"), which the dev
+# dependencies don't include yet, so skip them where it isn't installed.
+pytest.importorskip("pytest_homeassistant_custom_component")
+
+from custom_components.comfoconnect.const import CONF_LOCAL_UUID, CONF_UUID, DOMAIN
+from homeassistant.const import CONF_HOST
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+BRIDGE = "custom_components.comfoconnect.ComfoConnectBridge"
+UNIT_UUID = "00" * 16
+
+
+@pytest.fixture(autouse=True)
+def auto_enable_custom_integrations(enable_custom_integrations):
+    """Load the integration from custom_components."""
+    return
+
+
+async def test_unit_is_connected_through_the_bridge(hass: HomeAssistant) -> None:
+    """Both devices exist and the unit points at the bridge, without the deprecated `via_device`."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="192.0.2.10",
+        data={CONF_HOST: "192.0.2.10", CONF_UUID: UNIT_UUID, CONF_LOCAL_UUID: "11" * 16},
+    )
+    entry.add_to_hass(hass)
+
+    with (
+        patch(f"{BRIDGE}.connect", new_callable=AsyncMock),
+        patch(f"{BRIDGE}.disconnect", new_callable=AsyncMock),
+        patch(
+            f"{BRIDGE}.cmd_version_request",
+            new_callable=AsyncMock,
+            return_value=SimpleNamespace(serialNumber="DEMO0001", gatewayVersion=0),
+        ),
+        patch(f"{BRIDGE}.get_property", new_callable=AsyncMock, return_value="ComfoAir Q350"),
+        patch("custom_components.comfoconnect.version_decode", return_value="1.0.0"),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_forward_entry_setups",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch.object(
+            dr.DeviceRegistry,
+            "async_get_or_create",
+            autospec=True,
+            side_effect=dr.DeviceRegistry.async_get_or_create,
+        ) as get_or_create,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+
+    # Deprecated since Home Assistant 2026.7, stops working in 2027.8.
+    assert all("via_device" not in call.kwargs for call in get_or_create.call_args_list)
+
+    registry = dr.async_get(hass)
+    bridge_device = registry.async_get_device(identifiers={(DOMAIN, "DEMO0001")})
+    unit_device = registry.async_get_device(identifiers={(DOMAIN, UNIT_UUID)})
+    assert bridge_device is not None
+    assert unit_device is not None
+    assert unit_device.via_device_id == bridge_device.id

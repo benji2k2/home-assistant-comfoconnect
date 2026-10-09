@@ -119,7 +119,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     device_registry = dr.async_get(hass)
 
     # Add Bridge to device registry
-    device_registry.async_get_or_create(
+    bridge_device = device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, bridge_info.serialNumber)},
         manufacturer="Zehnder",
@@ -128,16 +128,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         sw_version=version_decode(bridge_info.gatewayVersion),
     )
 
-    # Add Ventilation Unit to device registry
-    device_registry.async_get_or_create(
+    # Add Ventilation Unit to device registry, connected through the bridge. Passing `via_device` to
+    # async_get_or_create is deprecated, and its replacement `via_device_id` only exists there since
+    # Home Assistant 2026.8, so link the devices with async_update_device, which works on all versions.
+    unit_device = device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, bridge.uuid)},
         manufacturer="Zehnder",
         name=unit_name,
         model=unit_model,
         sw_version=version_decode(unit_firmware),
-        via_device=(DOMAIN, bridge_info.serialNumber),
     )
+    device_registry.async_update_device(unit_device.id, via_device_id=bridge_device.id)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
